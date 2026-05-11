@@ -1,0 +1,5 @@
+repro_O[0-9]
+out_O[0-9].txt
+*.o
+*.mod
+.DS_Store

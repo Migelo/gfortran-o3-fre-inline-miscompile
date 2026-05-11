@@ -1,0 +1,143 @@
+name: demonstrate-bug
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# We want every matrix cell to run and report its verdict, even if one fails.
+jobs:
+  linux:
+    name: ${{ matrix.runner }} / gfortran-${{ matrix.gfortran }}
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04 ships gfortran-9..12 in its repos; ubuntu-24.04 ships
+        # gfortran-12..14. We cover both so we get the broadest version range.
+        include:
+          - runner: ubuntu-22.04
+            gfortran: "9"
+          - runner: ubuntu-22.04
+            gfortran: "10"
+          - runner: ubuntu-22.04
+            gfortran: "11"
+          - runner: ubuntu-22.04
+            gfortran: "12"
+          - runner: ubuntu-24.04
+            gfortran: "12"
+          - runner: ubuntu-24.04
+            gfortran: "13"
+          - runner: ubuntu-24.04
+            gfortran: "14"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gfortran-${{ matrix.gfortran }}
+        id: install
+        run: |
+          set -e
+          # Try the default apt index first; fall back to the toolchain PPA.
+          if sudo apt-get update && sudo apt-get install -y "gfortran-${{ matrix.gfortran }}"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Default repo did not have gfortran-${{ matrix.gfortran }}; trying ubuntu-toolchain-r/test PPA"
+            sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+            sudo apt-get update
+            if sudo apt-get install -y "gfortran-${{ matrix.gfortran }}"; then
+              echo "available=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "available=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Record environment
+        if: steps.install.outputs.available == 'true'
+        run: |
+          echo "uname -a: $(uname -a)"
+          echo "uname -m: $(uname -m)"
+          "gfortran-${{ matrix.gfortran }}" --version
+
+      - name: Compile + run at -O0/-O1/-O2/-O3
+        if: steps.install.outputs.available == 'true'
+        env:
+          FC: gfortran-${{ matrix.gfortran }}
+        run: |
+          set -e
+          bash ./run_matrix.sh "$FC"
+
+      - name: Compiler unavailable on this runner
+        if: steps.install.outputs.available != 'true'
+        run: |
+          echo "::warning::gfortran-${{ matrix.gfortran }} not installable on ${{ matrix.runner }}; skipping."
+
+  macos:
+    name: ${{ matrix.runner }} / gcc@${{ matrix.gcc }}
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            gcc: "13"
+          - runner: macos-14
+            gcc: "14"
+          - runner: macos-14
+            gcc: "15"
+          - runner: macos-13
+            gcc: "13"
+          - runner: macos-13
+            gcc: "14"
+          - runner: macos-13
+            gcc: "15"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gcc@${{ matrix.gcc }} via Homebrew
+        id: install
+        run: |
+          set -e
+          if brew install "gcc@${{ matrix.gcc }}"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Locate gfortran binary
+        id: locate
+        if: steps.install.outputs.available == 'true'
+        run: |
+          set -e
+          # On macOS arm64, Homebrew installs to /opt/homebrew; on x86_64 to /usr/local.
+          BREW_PREFIX="$(brew --prefix "gcc@${{ matrix.gcc }}")"
+          FC="${BREW_PREFIX}/bin/gfortran-${{ matrix.gcc }}"
+          if [ ! -x "$FC" ]; then
+            # Fallback: search the keg.
+            FC="$(find "$BREW_PREFIX/bin" -maxdepth 1 -name 'gfortran*' | head -n1)"
+          fi
+          echo "fc=$FC" >> "$GITHUB_OUTPUT"
+          echo "Using FC=$FC"
+
+      - name: Record environment
+        if: steps.install.outputs.available == 'true'
+        run: |
+          echo "uname -a: $(uname -a)"
+          echo "uname -m: $(uname -m)"
+          "${{ steps.locate.outputs.fc }}" --version
+
+      - name: Compile + run at -O0/-O1/-O2/-O3
+        if: steps.install.outputs.available == 'true'
+        env:
+          FC: ${{ steps.locate.outputs.fc }}
+        run: |
+          set -e
+          bash ./run_matrix.sh "$FC"
+
+      - name: Compiler unavailable on this runner
+        if: steps.install.outputs.available != 'true'
+        run: |
+          echo "::warning::gcc@${{ matrix.gcc }} not installable on ${{ matrix.runner }}; skipping."
