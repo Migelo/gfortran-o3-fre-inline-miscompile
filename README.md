@@ -167,3 +167,16 @@ Fortran-standard ambiguity in the reproducer. The `intel-ifx` matrix
 in the workflow runs as a control. The Intel oneAPI install is
 provided by the public composite action
 [`Migelo/setup-intel-oneapi`](https://github.com/Migelo/setup-intel-oneapi).
+
+### NVIDIA nvfortran (control case)
+
+The same `repro.f90` compiled with NVIDIA `nvfortran` (from the HPC SDK
+25.11, run inside the official `nvcr.io/nvidia/nvhpc:25.11-devel-cuda13.0-ubuntu24.04`
+container) does NOT exhibit the bug at any optimization level
+(`-O0`, `-O1`, `-O2`, `-O3`), providing a third independent
+Fortran-compiler data point. Combined with the Intel `ifx` matrix, this
+shows the bug is specific to gfortran's FRE / early-VRP / small-function-
+inliner pass cluster after inlining a contained subroutine with the
+`intent(inout) :: state` / `intent(out) :: z` argument split — not a
+Fortran-standard ambiguity in the reproducer. The `nvfortran` matrix in
+the workflow runs as an additional control alongside `intel-ifx`.

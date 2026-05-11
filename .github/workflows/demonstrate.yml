@@ -193,3 +193,68 @@ jobs:
       - name: Summarize
         run: |
           echo "::notice::ifx ${{ matrix.opt }}: ${{ steps.run.outputs.result }}"
+
+  nvfortran:
+    name: ubuntu-latest / nvfortran ${{ matrix.opt }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    # NVIDIA HPC SDK ships nvfortran in their official container. Pin a
+    # specific tag (NOT `latest`). The 25.x family is current as of 2026;
+    # we use 25.11 on ubuntu24.04 (verified present on nvcr.io and the
+    # newest 25.x devel tag at the time this job was added). The amd64
+    # image is ~6.3 GiB compressed; the runner has enough disk.
+    container:
+      image: nvcr.io/nvidia/nvhpc:25.11-devel-cuda13.0-ubuntu24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        opt: ['-O0', '-O1', '-O2', '-O3']
+    steps:
+      # The nvhpc:25.11-devel-ubuntu24.04 container ships node and git,
+      # so actions/checkout@v4 works out of the box. If a future tag drops
+      # node, switch to checkout@v3 or install node manually in a prep
+      # step.
+      - uses: actions/checkout@v4
+
+      - name: Record environment
+        run: |
+          echo "uname -a: $(uname -a)"
+          echo "uname -m: $(uname -m)"
+          nvfortran --version
+
+      - name: Compile and run repro at ${{ matrix.opt }}
+        id: run
+        continue-on-error: true
+        run: |
+          set -u
+          # nvfortran accepts -O0/-O1/-O2/-O3 with semantics broadly
+          # comparable to gfortran/ifx (default is -O2; -O3 enables
+          # additional unrolling and SIMD).  We pass exactly the matrix
+          # opt flag and nothing else, mirroring the ifx control matrix.
+          nvfortran ${{ matrix.opt }} repro.f90 -o /tmp/repro_nv
+          /tmp/repro_nv | tee /tmp/out.txt
+          # Bug detector mirrors the ifx job: parse the four hex words
+          # and check whether s(1) == s(3). We do not rely on the
+          # program's exit code because the gfortran -O3 miscompilation
+          # also folds the in-program "if s(1) == s(3) stop 1" guard,
+          # so a compiler that miscompiles the same way could print "OK"
+          # and exit 0 even with a degenerate state. See run_matrix.sh
+          # for the full rationale.
+          s1=$(grep -E '^s\(1\) = 0x' /tmp/out.txt | head -n1 | sed -E 's/^s\(1\) = 0x//')
+          s3=$(grep -E '^s\(3\) = 0x' /tmp/out.txt | head -n1 | sed -E 's/^s\(3\) = 0x//')
+          if [ -z "$s1" ] || [ -z "$s3" ]; then
+            echo "result=UNPARSEABLE" >> "$GITHUB_OUTPUT"
+            echo "::error::Could not parse s(1)/s(3) from program output"
+            exit 1
+          fi
+          if [ "$s1" = "$s3" ]; then
+            echo "result=BUG_PRESENT" >> "$GITHUB_OUTPUT"
+            echo "::error::nvfortran ${{ matrix.opt }} reproduces the bug (s(1)==s(3))"
+            exit 1
+          else
+            echo "result=NO_BUG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summarize
+        run: |
+          echo "::notice::nvfortran ${{ matrix.opt }}: ${{ steps.run.outputs.result }}"
