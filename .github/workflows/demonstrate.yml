@@ -141,3 +141,55 @@ jobs:
         if: steps.install.outputs.available != 'true'
         run: |
           echo "::warning::gcc@${{ matrix.gcc }} not installable on ${{ matrix.runner }}; skipping."
+
+  intel-ifx:
+    name: ubuntu-latest / ifx ${{ matrix.opt }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        opt: ['-O0', '-O1', '-O2', '-O3']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Intel oneAPI (ifx + icx + MPI)
+        uses: Migelo/setup-intel-oneapi@main
+        # No `with:` block — defaults install ifx + icx + Intel MPI
+        # and propagate the oneAPI env to subsequent steps.
+
+      - name: Record environment
+        run: |
+          echo "uname -a: $(uname -a)"
+          echo "uname -m: $(uname -m)"
+          ifx --version
+
+      - name: Compile and run repro at ${{ matrix.opt }}
+        id: run
+        continue-on-error: true
+        run: |
+          set -u
+          ifx ${{ matrix.opt }} repro.f90 -o /tmp/repro_ifx
+          /tmp/repro_ifx | tee /tmp/out.txt
+          # Detect the bug by parsing the four printed hex words. The bug
+          # signature is s(1) == s(3) (the -O3 gfortran miscompilation also
+          # folds the in-program guard, so the program's own exit code is
+          # not a reliable detector). See run_matrix.sh for the rationale.
+          s1=$(grep -E '^s\(1\) = 0x' /tmp/out.txt | head -n1 | sed -E 's/^s\(1\) = 0x//')
+          s3=$(grep -E '^s\(3\) = 0x' /tmp/out.txt | head -n1 | sed -E 's/^s\(3\) = 0x//')
+          if [ -z "$s1" ] || [ -z "$s3" ]; then
+            echo "result=UNPARSEABLE" >> "$GITHUB_OUTPUT"
+            echo "::error::Could not parse s(1)/s(3) from program output"
+            exit 1
+          fi
+          if [ "$s1" = "$s3" ]; then
+            echo "result=BUG_PRESENT" >> "$GITHUB_OUTPUT"
+            echo "::error::ifx ${{ matrix.opt }} reproduces the bug (s(1)==s(3))"
+            exit 1
+          else
+            echo "result=NO_BUG" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summarize
+        run: |
+          echo "::notice::ifx ${{ matrix.opt }}: ${{ steps.run.outputs.result }}"

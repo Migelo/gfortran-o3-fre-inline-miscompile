@@ -156,3 +156,14 @@ for the latest results.
 
 You can re-trigger the matrix at any time via "Run workflow" on the
 Actions page (the workflow has a `workflow_dispatch` trigger).
+
+### Intel ifx (control case)
+
+The same `repro.f90` compiled with Intel `ifx` (from oneAPI) does NOT
+exhibit the bug at any optimization level (`-O0`, `-O1`, `-O2`, `-O3`),
+demonstrating that the misbehaviour is specific to gfortran's
+FRE / early-VRP / small-function-inliner pass cluster and not a
+Fortran-standard ambiguity in the reproducer. The `intel-ifx` matrix
+in the workflow runs as a control. The Intel oneAPI install is
+provided by the public composite action
+[`Migelo/setup-intel-oneapi`](https://github.com/Migelo/setup-intel-oneapi).
