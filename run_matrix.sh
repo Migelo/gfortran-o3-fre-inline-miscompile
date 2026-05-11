@@ -59,7 +59,12 @@ for lvl in "${LEVELS[@]}"; do
     out="out_${lvl}.txt"
     echo
     echo "=== Compiling with -${lvl} ==="
-    if ! "$FC" "-${lvl}" repro.f90 -o "$bin" 2>&1; then
+    # -fno-range-check is needed for gfortran <= 9, which rejects
+    # 64-bit hex literals like z'9e3779b97f4a7c15' (high bit set) as
+    # "Arithmetic overflow converting INTEGER(16) to INTEGER(8)". The
+    # flag has no effect on the bug we're demonstrating; it just allows
+    # the program to compile on older gfortran.
+    if ! "$FC" "-${lvl}" -fno-range-check repro.f90 -o "$bin" 2>&1; then
         echo "compile-fail" > "$out"
         VERDICTS["$lvl"]="COMPILE-FAIL"
         WORDS["$lvl"]="(no output)"

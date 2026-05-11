@@ -33,6 +33,12 @@ That's it. Compare against `-O0`:
 gfortran -O0 repro.f90 -o repro_ok && ./repro_ok
 ```
 
+(On gfortran 9 and older you may additionally need `-fno-range-check`,
+which lets the compiler accept the 64-bit hex literals like
+`z'9e3779b97f4a7c15'` whose high bit is set. The flag does not affect
+the bug being demonstrated — it is a Fortran-language compatibility
+knob for older compilers.)
+
 ## Expected vs actual output
 
 ```
