@@ -4,24 +4,140 @@
 
 ## TL;DR
 
-`gfortran` 15.2 (at least) at `-O3` constant-folds the output of
-consecutive calls to an inlined **contained (internal) subroutine** whose
-signature is `(intent(inout) :: state, intent(out) :: z)`. The third call
-returns the same `z` as the first. The 48-line reproducer in this repo is a
-SplitMix64 step used to initialize an `xoshiro256**` RNG state; at `-O3`
-the cold-start state comes out with `s(1) == s(3)` instead of four
-distinct 64-bit values. Observed on the live CI matrix in this repo
-(see the [Actions tab](https://github.com/Migelo/gfortran-o3-fre-inline-miscompile/actions)).
+`gcc` 9.5 through 15.2 at `-O2`/`-O3` emit a basic block that prints two
+signed-int64 values as the same hex constant (`0x7FFFFFFFFFFFFFFF`,
+i.e. `INT64_MAX`) and immediately afterwards takes the `a != b` branch
+on those values. The optimiser's range pass folds the two values to the
+same point-value AND simultaneously concludes that they cannot be equal,
+in the same pass. Adding `-fwrapv` or `-fno-strict-overflow` makes the
+miscompile go away at every -O level. The 22-line minimal C reproducer
+is [`repro_min.c`](repro_min.c); the original Fortran case is
+[`repro.f90`](repro.f90), where the same fold silently corrupted the
+RNG state of a production plasma simulation.
 
-The bug only appears at `-O3`. `-O0`, `-O1`, `-O2`, `-Os`, `-Og` are all
-fine. Per-pass bisection points at `-ftree-fre` (Full Redundancy
-Elimination), `-ftree-vrp` (Value Range Propagation), and the inliner
-(`-finline-small-functions`): adding any one of `-fno-tree-fre`,
-`-fno-tree-vrp`, or `-fno-inline-small-functions` to `-O3` makes the bug
-go away. So does moving the subroutine out of `contains` into its own
-module.
+The original Fortran case manifests only at `-O3`, in a SplitMix64 step
+used to initialise an `xoshiro256**` state for the `dHybridR` simulation;
+the third call to a contained subroutine returns the same `z` as the
+first, so `s(1) == s(3)`. Per-pass bisection on the Fortran case points
+at `-ftree-fre` (Full Redundancy Elimination), `-ftree-vrp` (Value Range
+Propagation), and the inliner (`-finline-small-functions`): adding any
+one of `-fno-tree-fre`, `-fno-tree-vrp`, or `-fno-inline-small-functions`
+to `-O3` makes the bug go away. So does moving the subroutine out of
+`contains` into its own module. Observed on the live CI matrix in this
+repo (see the [Actions tab](https://github.com/Migelo/gfortran-o3-fre-inline-miscompile/actions)).
 
-## Reproduce yourself
+## Reproduce yourself (minimal: 22 lines of C)
+
+```
+gcc -O3 repro_min.c -o m && ./m; echo exit=$?
+```
+
+`repro_min.c` is a 22-line straight-line C program — no procedure call,
+no Fortran front end, no contained subroutine, no derived type. It does
+three `(state += K1; s[i] = state * K2)` triples on `int64_t` where both
+`K1` and `K2` have the high bit set (so the multiplies overflow signed
+int64). It then prints `s[0]`, `s[1]`, `s[2]` and asserts `s[0] != s[2]`.
+
+What you see on every gcc we tested (9.5 / 10.1 / 11.1 / 12.1 / 14.1 /
+15.2, all self-built on x86_64 linux) is:
+
+```
+s[0] = 0x7FFFFFFFFFFFFFFF
+s[1] = 0x8000000000000000
+s[2] = 0x7FFFFFFFFFFFFFFF   <-- equal to s[0]
+OK: s[0] != s[2]            <-- printed anyway; exit 0
+```
+
+The same gcc, same source, with one extra flag:
+
+```
+gcc -O3 -fwrapv repro_min.c -o m && ./m
+s[0] = 0xBFA0DD452DD35E32
+s[1] = 0xEA7170CF4875AA79
+s[2] = 0x154204596317F6C0
+OK: s[0] != s[2]            <-- exit 0, and now actually true
+```
+
+The C reproducer demonstrates the gcc-side root cause: signed-overflow
+range reasoning in EVRP. The original Fortran reproducer (`repro.f90`,
+below) is the production case that exposed it.
+
+## Flag influence
+
+`run_flag_matrix.sh` runs `repro_min.c` through one gcc binary at a
+small grid of flag combinations. The output on gcc 15.2 is:
+
+```
+  FLAGS                          | s[0]               | s[2]               | rc  | VERDICT
+  -------------------------------+--------------------+--------------------+-----+-------
+  -O0                            | 0xBFA0DD452DD35E32 | 0x154204596317F6C0 | 0   | CLEAN
+  -O1                            | 0x7FFFFFFFFFFFFFFF | 0x7FFFFFFFFFFFFFFF | 0   | FOLD+CHECK_KILLED
+  -O2                            | 0x7FFFFFFFFFFFFFFF | 0x7FFFFFFFFFFFFFFF | 0   | FOLD+CHECK_KILLED
+  -O3                            | 0x7FFFFFFFFFFFFFFF | 0x7FFFFFFFFFFFFFFF | 0   | FOLD+CHECK_KILLED
+  -O3 -fwrapv                    | 0xBFA0DD452DD35E32 | 0x154204596317F6C0 | 0   | CLEAN
+  -O3 -fno-strict-overflow       | 0xBFA0DD452DD35E32 | 0x154204596317F6C0 | 0   | CLEAN
+  -O3 -Wstrict-overflow=5        | 0x7FFFFFFFFFFFFFFF | 0x7FFFFFFFFFFFFFFF | 0   | FOLD+CHECK_KILLED
+```
+
+Three things this grid is meant to make obvious:
+
+1. **The two opt-out flags work.** Either `-fwrapv` (define wraparound)
+   or `-fno-strict-overflow` (forbid the optimiser from assuming overflow
+   is UB) eliminates the miscompile at every -O level.
+2. **The diagnostic is silent.** `-O3 -Wstrict-overflow=5 -Wall -Wextra`
+   on this code emits no warning at any level from N=1 to N=5 on any of
+   the six gcc versions we tested. The bisect we did (see
+   `gcc/vr-values.c` in gcc-10.5 vs gcc-15.2) shows the
+   `warn_strict_overflow` hook that used to live in
+   `vrp_evaluate_conditional` was removed during the Ranger rewrite in
+   the gcc-12 era. There is now no policy mechanism announcing the fold.
+3. **`-O1` is enough.** On the minimal C reproducer the miscompile is
+   not gated on `-O3`-specific passes; `-O1` already exhibits it. The
+   `-O3`-only behaviour the Fortran section below reports is a function
+   of the larger Fortran mixing chain (full splitmix64 with shifts and
+   xors), not of `-O3` itself.
+
+## The EVRP self-inconsistency (the recent find)
+
+Compile the program with `-O3 -fdump-tree-optimized=optimized.dump` and
+read `optimized.dump`. The body of `main` is collapsed to a single basic
+block (gcc 15.2 output, verbatim):
+
+```
+;; Function main (main, funcdef_no=11) (executed once)
+int main (int argc, char * * argv)
+  <bb 2> [local count: 1073741824]:
+  printf ("s[0] = 0x%016llX\n", 9223372036854775807);
+  printf ("s[1] = 0x%016llX\n", 9223372036854775808);
+  printf ("s[2] = 0x%016llX\n", 9223372036854775807);
+  __builtin_puts (&"OK: s[0] != s[2]"[0]);
+  return 0;
+```
+
+That basic block contains two EVRP deductions about the same SSA values,
+side by side:
+
+- **Point-fold:** `s[0]` and `s[2]` both fold to `INT64_MAX` (the
+  saturation value the signed-overflow chain saturates at). Visible in
+  the printf constants and in the hex output the program prints.
+- **Range-relation:** `s[0] != s[2]` is constant true. Visible in the
+  choice of rodata string (`"OK: s[0] != s[2]"`, not the BUG branch)
+  and in the unconditional `return 0`.
+
+These cannot both be true. The first deduction says the values are
+equal; the second says they are unequal. Both come out of the same
+pass.
+
+The standard upstream response to "gcc miscompiles signed overflow at
+-O3" is WONTFIX since 2007 (PR 30475), on the grounds that signed
+overflow is UB and the user must opt out via `-fwrapv` or
+`-fno-strict-overflow`. That is policy and not under dispute here.
+What this section is reporting separately is that the optimiser's own
+range model is internally inconsistent on this fold: it simultaneously
+believes the two values are equal and unequal. That self-inconsistency
+is independent of the UB-exploitation policy.
+
+## Reproduce the Fortran case
 
 ```
 gfortran -O3 repro.f90 -o repro && ./repro
@@ -133,6 +249,14 @@ the `VOLATILE` nor `!GCC$ ATTRIBUTES NOINLINE` workarounds were effective.
 GCC Bugzilla report: to be filed at https://gcc.gnu.org/bugzilla/.
 This repository will be linked from that report so any developer can
 re-run the live CI matrix and see the bug reproduce on demand.
+
+The angle worth filing on is the **EVRP self-inconsistency** (see the
+section above), not the raw signed-overflow miscompile — that part is
+well-trodden ground (PR 30475, WONTFIX since 2007). The optimised-tree
+dump from `repro_min.c` is the minimal artefact: a single basic block
+in which the pass simultaneously folds two SSA values to the same
+constant and concludes that they cannot be equal. The miscompile is a
+consequence of that inconsistency; the inconsistency is the bug.
 
 ## CI matrix
 
