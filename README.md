@@ -1,107 +1,119 @@
-# gfortran -O3 miscompiles consecutive calls to a contained subroutine with intent(inout)
+# gfortran -O3 SplitMix64 surprise — case study, not a gcc bug
 
 [![demonstrate-bug](https://github.com/Migelo/gfortran-o3-fre-inline-miscompile/actions/workflows/demonstrate.yml/badge.svg)](https://github.com/Migelo/gfortran-o3-fre-inline-miscompile/actions/workflows/demonstrate.yml)
 
+> **Retraction note.** This repository was initially set up to file a gcc
+> bug report about a SplitMix64 RNG initialiser silently producing
+> `s(1) == s(3)` at `-O3` (the original framing the repo URL reflects:
+> "gfortran FRE/inliner miscompile"). On closer analysis the cause is
+> signed-int64 overflow UB exploitation, which is settled upstream
+> policy: see [PR 30475](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=30475),
+> RESOLVED INVALID since 2007. There is no gcc defect here to file. The
+> repository is preserved as a case study of how subtle this UB pattern
+> can be inside a production scientific code, and as documentation of
+> the one-line fix.
+
 ## TL;DR
 
-`gcc` 9.5 through 15.2 at `-O2`/`-O3` emit a basic block that prints two
-signed-int64 values as the same hex constant (`0x7FFFFFFFFFFFFFFF`,
-i.e. `INT64_MAX`) and immediately afterwards takes the `a != b` branch
-on those values. The optimiser's range pass folds the two values to the
-same point-value AND simultaneously concludes that they cannot be equal,
-in the same pass. Adding `-fwrapv` or `-fno-strict-overflow` makes the
-miscompile go away at every -O level. The 22-line minimal C reproducer
-is [`repro_min.c`](repro_min.c); the original Fortran case is
-[`repro.f90`](repro.f90), where the same fold silently corrupted the
-RNG state of a production plasma simulation.
+A small SplitMix64 step compiled with `gcc`/`gfortran` at `-O2` or
+higher and default `-fstrict-overflow` can silently produce a
+degenerate RNG state. The cause is the signed-int64 multiplies by
+`0x94d049bb133111eb` (high bit set, so the product overflows the signed
+range), which is undefined behaviour the optimiser is allowed to
+exploit. The fix is one flag — `-fwrapv` or `-fno-strict-overflow` —
+applied to the file that does the mixing. Either flag eliminates the
+miscompile at every -O level.
 
-The original Fortran case manifests only at `-O3`, in a SplitMix64 step
-used to initialise an `xoshiro256**` state for the `dHybridR` simulation;
-the third call to a contained subroutine returns the same `z` as the
-first, so `s(1) == s(3)`. Per-pass bisection on the Fortran case points
-at `-ftree-fre` (Full Redundancy Elimination), `-ftree-vrp` (Value Range
-Propagation), and the inliner (`-finline-small-functions`): adding any
-one of `-fno-tree-fre`, `-fno-tree-vrp`, or `-fno-inline-small-functions`
-to `-O3` makes the bug go away. So does moving the subroutine out of
-`contains` into its own module. Observed on the live CI matrix in this
-repo (see the [Actions tab](https://github.com/Migelo/gfortran-o3-fre-inline-miscompile/actions)).
+The repository contains:
 
-## Reproduce yourself (minimal: 22 lines of C)
+- [`repro_min.c`](repro_min.c) — 22-line minimal C reproducer.
+- [`run_flag_matrix.sh`](run_flag_matrix.sh) — a small flag grid
+  showing precisely which options change the verdict.
+- [`repro.f90`](repro.f90) — the original Fortran reproducer extracted
+  from the `dHybridR` plasma simulation; this is the production case
+  that exposed the issue.
+- [`run_matrix.sh`](run_matrix.sh) + a GitHub Actions workflow that
+  runs the Fortran reproducer across gfortran 9..15 on Ubuntu and
+  macOS, plus Intel `ifx` and NVIDIA `nvfortran` as cross-compiler
+  controls.
+
+## Minimal C reproducer
 
 ```
-gcc -O3 repro_min.c -o m && ./m; echo exit=$?
+gcc -O3 repro_min.c -o m && ./m
 ```
 
-`repro_min.c` is a 22-line straight-line C program — no procedure call,
-no Fortran front end, no contained subroutine, no derived type. It does
-three `(state += K1; s[i] = state * K2)` triples on `int64_t` where both
-`K1` and `K2` have the high bit set (so the multiplies overflow signed
-int64). It then prints `s[0]`, `s[1]`, `s[2]` and asserts `s[0] != s[2]`.
+`repro_min.c` is 22 lines of straight-line C — no procedure call, no
+Fortran front end, no contained subroutine, no derived type. It does
+three `(state += K1; s[i] = state * K2)` triples on `int64_t` where
+both `K1 = 0x9e3779b97f4a7c15` and `K2 = 0x94d049bb133111eb` have the
+high bit set, so the multiplies overflow signed int64. It prints
+`s[0]`, `s[1]`, `s[2]` and tests `s[0] != s[2]`.
 
-What you see on every gcc we tested (9.5 / 10.1 / 11.1 / 12.1 / 14.1 /
-15.2, all self-built on x86_64 linux) is:
+Output with default flags (any gcc 9.5 through 15.2 we tested):
 
 ```
 s[0] = 0x7FFFFFFFFFFFFFFF
 s[1] = 0x8000000000000000
-s[2] = 0x7FFFFFFFFFFFFFFF   <-- equal to s[0]
-OK: s[0] != s[2]            <-- printed anyway; exit 0
+s[2] = 0x7FFFFFFFFFFFFFFF      <-- printed equal to s[0]
+OK: s[0] != s[2]                <-- printed anyway; exit 0
 ```
 
-The same gcc, same source, with one extra flag:
+The "equal hex / OK branch" combination is not a self-contradiction
+inside the optimiser (we initially thought it was — see the section
+below on why that framing is wrong). It is the visible artefact of
+two independent passes each making sound deductions under the
+TYPE_OVERFLOW_UNDEFINED model.
+
+Same source with `-fwrapv`:
 
 ```
-gcc -O3 -fwrapv repro_min.c -o m && ./m
 s[0] = 0xBFA0DD452DD35E32
 s[1] = 0xEA7170CF4875AA79
 s[2] = 0x154204596317F6C0
-OK: s[0] != s[2]            <-- exit 0, and now actually true
+OK: s[0] != s[2]
 ```
 
-The C reproducer demonstrates the gcc-side root cause: signed-overflow
-range reasoning in EVRP. The original Fortran reproducer (`repro.f90`,
-below) is the production case that exposed it.
+The wrapping-arithmetic values now actually differ.
 
-## Flag influence
+## Flag matrix
 
-`run_flag_matrix.sh` runs `repro_min.c` through one gcc binary at a
-small grid of flag combinations. The output on gcc 15.2 is:
+`run_flag_matrix.sh <gcc>` runs `repro_min.c` through one gcc binary
+at a small grid of flag combinations. On gcc 15.2:
 
 ```
-  FLAGS                          | s[0]               | s[2]               | rc  | VERDICT
-  -------------------------------+--------------------+--------------------+-----+-------
-  -O0                            | 0xBFA0DD452DD35E32 | 0x154204596317F6C0 | 0   | CLEAN
-  -O1                            | 0x7FFFFFFFFFFFFFFF | 0x7FFFFFFFFFFFFFFF | 0   | FOLD+CHECK_KILLED
-  -O2                            | 0x7FFFFFFFFFFFFFFF | 0x7FFFFFFFFFFFFFFF | 0   | FOLD+CHECK_KILLED
-  -O3                            | 0x7FFFFFFFFFFFFFFF | 0x7FFFFFFFFFFFFFFF | 0   | FOLD+CHECK_KILLED
-  -O3 -fwrapv                    | 0xBFA0DD452DD35E32 | 0x154204596317F6C0 | 0   | CLEAN
-  -O3 -fno-strict-overflow       | 0xBFA0DD452DD35E32 | 0x154204596317F6C0 | 0   | CLEAN
-  -O3 -Wstrict-overflow=5        | 0x7FFFFFFFFFFFFFFF | 0x7FFFFFFFFFFFFFFF | 0   | FOLD+CHECK_KILLED
+  FLAGS                          | s[0]               | s[2]               | rc | VERDICT
+  -------------------------------+--------------------+--------------------+----+-------
+  -O0                            | 0xBFA0DD452DD35E32 | 0x154204596317F6C0 | 0  | CLEAN
+  -O1                            | 0x7FFFFFFFFFFFFFFF | 0x7FFFFFFFFFFFFFFF | 0  | FOLD+CHECK_KILLED
+  -O2                            | 0x7FFFFFFFFFFFFFFF | 0x7FFFFFFFFFFFFFFF | 0  | FOLD+CHECK_KILLED
+  -O3                            | 0x7FFFFFFFFFFFFFFF | 0x7FFFFFFFFFFFFFFF | 0  | FOLD+CHECK_KILLED
+  -O3 -fwrapv                    | 0xBFA0DD452DD35E32 | 0x154204596317F6C0 | 0  | CLEAN
+  -O3 -fno-strict-overflow       | 0xBFA0DD452DD35E32 | 0x154204596317F6C0 | 0  | CLEAN
+  -O3 -Wstrict-overflow=5        | 0x7FFFFFFFFFFFFFFF | 0x7FFFFFFFFFFFFFFF | 0  | FOLD+CHECK_KILLED
 ```
 
-Three things this grid is meant to make obvious:
+Reading the grid:
 
-1. **The two opt-out flags work.** Either `-fwrapv` (define wraparound)
-   or `-fno-strict-overflow` (forbid the optimiser from assuming overflow
-   is UB) eliminates the miscompile at every -O level.
-2. **The diagnostic is silent.** `-O3 -Wstrict-overflow=5 -Wall -Wextra`
-   on this code emits no warning at any level from N=1 to N=5 on any of
-   the six gcc versions we tested. The bisect we did (see
-   `gcc/vr-values.c` in gcc-10.5 vs gcc-15.2) shows the
-   `warn_strict_overflow` hook that used to live in
-   `vrp_evaluate_conditional` was removed during the Ranger rewrite in
-   the gcc-12 era. There is now no policy mechanism announcing the fold.
-3. **`-O1` is enough.** On the minimal C reproducer the miscompile is
-   not gated on `-O3`-specific passes; `-O1` already exhibits it. The
-   `-O3`-only behaviour the Fortran section below reports is a function
-   of the larger Fortran mixing chain (full splitmix64 with shifts and
-   xors), not of `-O3` itself.
+- `-fwrapv` (define wraparound) or `-fno-strict-overflow` (forbid the
+  optimiser from assuming overflow is UB) eliminates the miscompile at
+  every -O level. Pick either; both work.
+- The fold happens at `-O1` already; `-O3` is not load-bearing on the
+  minimal C case (the `-O3`-only behaviour in the Fortran case below is
+  a function of the larger mixing chain, not of `-O3`).
+- `-Wstrict-overflow=5 -Wall -Wextra` is silent. That is not a defect
+  in this fold; `-Wstrict-overflow` was deprecated in the gcc-8 changes
+  notes (the silencing commit is [r8-3771-g6358a676c3eb4c6df013ce8319bcf429cd14232b](https://gcc.gnu.org/cgit/gcc/commit/?id=6358a676c3eb4c6df013ce8319bcf429cd14232b),
+  identified by Jakub Jelinek in [PR 30475 c#65](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=30475#c65)),
+  and the open regression tracker is [PR 80511](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80511).
+  Upstream's recommended replacement is `-fsanitize=signed-integer-overflow`
+  at runtime.
 
-## The EVRP self-inconsistency (the recent find)
+## Why the optimised output looks contradictory (and why it isn't)
 
-Compile the program with `-O3 -fdump-tree-optimized=optimized.dump` and
-read `optimized.dump`. The body of `main` is collapsed to a single basic
-block (gcc 15.2 output, verbatim):
+The optimised-tree dump from `gcc -O3 -fdump-tree-optimized` of
+`repro_min.c` collapses `main` to a single basic block (gcc 15.2
+verbatim):
 
 ```
 ;; Function main (main, funcdef_no=11) (executed once)
@@ -114,58 +126,60 @@ int main (int argc, char * * argv)
   return 0;
 ```
 
-That basic block contains two EVRP deductions about the same SSA values,
-side by side:
+Read literally this looks like the optimiser believes `s[0] == s[2]`
+(the printf format arguments) and `s[0] != s[2]` (the chosen rodata
+string and `return 0`) simultaneously. That reading is wrong, and is
+where our initial bug-report framing failed.
 
-- **Point-fold:** `s[0]` and `s[2]` both fold to `INT64_MAX` (the
-  saturation value the signed-overflow chain saturates at). Visible in
-  the printf constants and in the hex output the program prints.
-- **Range-relation:** `s[0] != s[2]` is constant true. Visible in the
-  choice of rodata string (`"OK: s[0] != s[2]"`, not the BUG branch)
-  and in the unconditional `return 0`.
+Two different things produce the two facts:
 
-These cannot both be true. The first deduction says the values are
-equal; the second says they are unequal. Both come out of the same
-pass.
+1. **The printed values' equality is UB-conditional.** Under
+   TYPE_OVERFLOW_UNDEFINED, `range-op.cc` (`operator_mult::wi_op_overflows`)
+   saturates overflowing multiplies to `wi::max_value` / `wi::min_value`
+   and *reports `false`* — "no overflow occurred". On the no-UB traces
+   the optimiser is licensed to consider, the saturated point-value is
+   the only consistent value, so EVRP point-folds `s[0]` and `s[2]` to
+   `INT64_MAX` for the printf operands.
 
-The standard upstream response to "gcc miscompiles signed overflow at
--O3" is WONTFIX since 2007 (PR 30475), on the grounds that signed
-overflow is UB and the user must opt out via `-fwrapv` or
-`-fno-strict-overflow`. That is policy and not under dispute here.
-What this section is reporting separately is that the optimiser's own
-range model is internally inconsistent on this fold: it simultaneously
-believes the two values are equal and unequal. That self-inconsistency
-is independent of the UB-exploitation policy.
+2. **The branch elimination is unconditionally correct.** Compute
+   `(s[0] - s[2]) mod 2^64` with wrapping arithmetic
+   (`-fwrapv` semantics): the answer is `0xAA5ED8EBCABB6772`, nonzero.
+   So `s[0] != s[2]` is true under wrapping too. The branch fold is
+   not UB-exploitation; it is a correct algebraic simplification an
+   optimiser is allowed to make under any signed/unsigned/wrapping
+   interpretation.
 
-## Reproduce the Fortran case
+The two deductions are individually sound; only their visible
+co-occurrence in one dump looks contradictory. The optimiser never
+holds a value-range object asserting both. This is exactly the kind of
+report Andrew Pinski and Jakub Jelinek dispatch in PR 30475: vacuous
+truths derived under empty (UB-excluded) trace sets can disagree
+pairwise without indicating a soundness defect, and there are ~40
+match.pd sites that would each need their own warning hook to flag
+this kind of fold individually, which is why `-Wstrict-overflow` was
+retired.
+
+## Original Fortran case
+
+The production trigger was `random.f90` in the `dHybridR` relativistic
+hybrid plasma simulation. The 48-line Fortran reproducer is
+[`repro.f90`](repro.f90):
 
 ```
 gfortran -O3 repro.f90 -o repro && ./repro
 ```
 
-That's it. Compare against `-O0`:
-
 ```
-gfortran -O0 repro.f90 -o repro_ok && ./repro_ok
-```
-
-(On gfortran 9 and older you may additionally need `-fno-range-check`,
-which lets the compiler accept the 64-bit hex literals like
-`z'9e3779b97f4a7c15'` whose high bit is set. The flag does not affect
-the bug being demonstrated — it is a Fortran-language compatibility
-knob for older compilers.)
-
-## Expected vs actual output
-
-```
-$ gfortran -O3 repro.f90 -o repro && ./repro      # WRONG
 s(1) = 0x8000000100000000
 s(2) = 0x346EDCE5F713F8ED
-s(3) = 0x8000000100000000        <-- identical to s(1)
+s(3) = 0x8000000100000000        <-- equal to s(1)
 s(4) = 0x2D160E7E5C3F42CA
- OK: four distinct state words   <-- IF was folded at compile time; wrong
+ OK: four distinct state words   <-- the in-program guard was folded too
+```
 
-$ gfortran -O0 repro.f90 -o repro && ./repro      # CORRECT
+Compare against `-O0`:
+
+```
 s(1) = 0x22118258A9D111A0
 s(2) = 0x346EDCE5F713F8ED
 s(3) = 0x1E9A57BC80E6721D
@@ -173,134 +187,115 @@ s(4) = 0x2D160E7E5C3F42CA
  OK: four distinct state words
 ```
 
-Note that the `if (s(1) == s(3) ...) stop 1` guard inside `repro.f90` is
-**itself folded away at `-O3` using the (incorrect) value numbering**, so
-the program prints "OK" and exits 0 even when its own state is degenerate.
-The CI in this repo therefore detects the bug by parsing the printed hex
-words, not by the program's exit code.
+(On gfortran 9 and older you additionally need `-fno-range-check` so
+the front end accepts 64-bit hex literals with the high bit set, like
+`z'9e3779b97f4a7c15'`. The flag does not change the optimisation
+behaviour being demonstrated.)
 
-## What is and isn't required to trigger
+The Fortran case is a thicker version of the C reduction. It has the
+same root cause (signed int64 multiplies overflow into UB) plus extra
+mixing (`ieor` + `ishft` shifts) that lets `-ftree-fre`, `-ftree-vrp`,
+and `-finline-small-functions` cooperate to fold the third call's
+output to the first's. Disabling any one of those passes hides it.
 
-Each row below is a separate code variant tested against `-O3` (no other
-flags). "BUG" = `s(1) == s(3)`; "OK" = four distinct values.
+### What is and isn't required to trigger the Fortran case
+
+Each row below is a separate code variant tested against `-O3`. "BUG"
+= `s(1) == s(3)`; "OK" = four distinct values.
 
 | Variant | Result at `-O3` |
 |---|---|
 | Derived-type `t_rng%s(4)` + contained subroutine *(this repo)* | **BUG** |
-| Plain `integer(int64) :: s(4)` + contained subroutine | **BUG** — derived type is not required |
-| Plain `s(4)` + `do i=1,4` loop calling the contained subroutine | **BUG** — and gfortran emits `-Waggressive-loop-optimizations` ("iteration 1 invokes undefined behavior"); all four words collapse |
-| Plain `s(4)` + **module** subroutine (separate `module m_repro contains …`) | OK — must be a *contained* (internal) procedure |
-| Plain `s(4)` + contained **function** (single inout state, returns z) | OK — bug is specific to the subroutine form with separate inout + out args |
-| Plain `s(4)` + four fully-inlined splitmix64 bodies (no procedure call) | OK — bug needs the procedure boundary |
+| Plain `integer(int64) :: s(4)` + contained subroutine | **BUG** |
+| Plain `s(4)` + `do i=1,4` loop calling the contained subroutine | **BUG** (and gfortran emits `-Waggressive-loop-optimizations`: "iteration 1 invokes undefined behavior") |
+| Plain `s(4)` + **module** subroutine | OK — needs a contained (internal) procedure |
+| Plain `s(4)` + contained **function** form | OK — bug is specific to the subroutine form with separate inout + out args |
+| Plain `s(4)` + four fully-inlined splitmix64 bodies | OK — needs the procedure boundary |
 | Body shortened to `state = state + 1; z = state * 2` | OK — body must be substantial enough to interest FRE |
-| Body shortened to splitmix64 minus the last `ieor(z, ishft(z,-31))` line | OK — full splitmix64 mixing is needed |
 
-Minimum recipe:
-
-1. A **contained (internal) subroutine** — module form does not reproduce.
-2. Subroutine has both `intent(inout) :: state` and `intent(out) :: z` arguments.
-3. The caller invokes it >= 4 times in a row, passing the *same* `state`
-   and successive array elements as `z`.
-4. The body must include enough mixing (xor + shift + multiply) for the
-   gfortran inliner to emit non-trivial SSA — full splitmix64 triggers;
-   `state+1; z=state*2` does not.
-
-Not required: LTO, `-funroll-loops`, `-fopenmp-simd`, `-faggressive-loop-optimizations`,
-`-fipa-modref`, `-fipa-pure-const`, `-ftree-sra`, `-ftree-pre`,
-`-ftree-dse`, `-ftree-forwprop`, `-ftree-copy-prop`. Disabling any one of
-these still leaves the bug.
-
-## Workarounds
-
-These are workarounds, **not fixes**:
+### Workarounds (any of these is sufficient)
 
 | Workaround | Effective? |
 |---|---|
+| **`-fwrapv` on the offending TU** (recommended; one flag, no perf loss elsewhere) | yes |
+| **`-fno-strict-overflow` on the offending TU** | yes |
 | Drop to `-O2` (or `-O1`, `-Os`, `-Og`) | yes |
-| Compile only the offending TU with `-O0` (`set_source_files_properties(... -O0)` in CMake) | yes |
-| Compile only the offending TU with `-O3 -fno-tree-fre` | yes — least drastic |
+| `-O3 -fno-tree-fre` on the offending TU | yes — least drastic if `-fwrapv` is contraindicated |
 | `-O3 -fno-inline-small-functions` | yes |
-| Convert the contained subroutine to a module subroutine in a separate file | yes |
-| Convert to a function form (single inout state arg, returns z) | yes |
-| Manually inline the four splitmix64 bodies at the call site | yes |
-| `VOLATILE` attribute on the output argument | **no** (verified in upstream project) |
-| `!GCC$ ATTRIBUTES NOINLINE` on the subroutine | **no** (verified in upstream project) |
-| Drop `-flto` | **no** — the bug fires without `-flto` |
+| Move the contained subroutine into a module | yes |
+| Manually inline the splitmix64 body at each call site | yes |
+| `VOLATILE` attribute on the output argument | **no** |
+| `!GCC$ ATTRIBUTES NOINLINE` on the subroutine | **no** |
 
-## Why this matters
+In `dHybridR` the production fix is a per-source-file CMake override:
 
-This bug silently miscompiled the RNG initialization in `dHybridR`
-(a relativistic hybrid plasma simulation). The xoshiro256** state was
-seeded with `s(1) == s(3)`, so the RNG produced identical 64-bit values
-on alternating draws. Maxwellian particle velocity samples drawn from
-that RNG looked plausible — bell-shaped, right mean and variance — but
-were silently correlated across particle pairs, contaminating every
-stochastic outcome in the simulation. The defect survived all
-sanity checks because the failure mode was "wrong physics, plausible
-numbers", not "crash" or "NaN".
+```cmake
+set_source_files_properties(random.f90 PROPERTIES COMPILE_OPTIONS "-fwrapv")
+```
 
-The fix in production was a per-source-file CMake override pinning
-`random.f90` to `-O0` (later relaxed to `-fno-tree-fre`), plus a hardened
-RNG init that manually inlines the splitmix64 body four times — neither
-the `VOLATILE` nor `!GCC$ ATTRIBUTES NOINLINE` workarounds were effective.
+## Why this matters operationally
 
-## Status
+The defect survived all sanity checks because the failure mode was
+"wrong physics, plausible numbers", not "crash" or "NaN". The
+`xoshiro256**` state was seeded with `s(1) == s(3)`, so the RNG
+produced identical 64-bit values on alternating draws. Maxwellian
+particle velocity samples drawn from that RNG looked plausible —
+bell-shaped, right mean and variance — but were silently correlated
+across particle pairs, contaminating every stochastic outcome of the
+simulation.
 
-GCC Bugzilla report: to be filed at https://gcc.gnu.org/bugzilla/.
-This repository will be linked from that report so any developer can
-re-run the live CI matrix and see the bug reproduce on demand.
+The take-aways for downstream Fortran code that does multiplicative
+hashing or RNG seeding with int64 constants that have the high bit
+set:
 
-The angle worth filing on is the **EVRP self-inconsistency** (see the
-section above), not the raw signed-overflow miscompile — that part is
-well-trodden ground (PR 30475, WONTFIX since 2007). The optimised-tree
-dump from `repro_min.c` is the minimal artefact: a single basic block
-in which the pass simultaneously folds two SSA values to the same
-constant and concludes that they cannot be equal. The miscompile is a
-consequence of that inconsistency; the inconsistency is the bug.
+1. Audit for `integer(int64)` multiplies of hex constants ≥ `z'8000000000000000'`.
+2. Add `-fwrapv` (or `-fno-strict-overflow`) for any source file doing
+   that arithmetic intentionally, per-file via
+   `set_source_files_properties` so the rest of the build keeps the
+   default optimisation model.
+3. Don't rely on in-program guards like `if (s(1) == s(3)) stop 1` —
+   the same fold that produces the degenerate state will also fold
+   the guard.
 
 ## CI matrix
 
 The [`demonstrate-bug` workflow](.github/workflows/demonstrate.yml)
-compiles `repro.f90` at `-O0`, `-O1`, `-O2`, `-O3` against multiple
-gfortran versions on multiple OS / architecture combinations:
+compiles `repro.f90` at `-O0`, `-O1`, `-O2`, `-O3` across:
 
 - **Ubuntu 22.04** (x86_64): gfortran 9, 10, 11, 12.
-- **Ubuntu 24.04** (x86_64): gfortran 12, 13, 14.
-- **macOS 13** (x86_64): Homebrew gcc@13, gcc@14, gcc@15.
-- **macOS 14** (arm64):  Homebrew gcc@13, gcc@14, gcc@15.
+- **Ubuntu 24.04** (x86_64): gfortran 12, 13, 14, 15.
+- **macOS 13 / 14** (x86_64 / arm64): Homebrew gcc@13, gcc@14, gcc@15.
 
-For each cell the CI parses the four hex words from the program's stdout
-and decides `BUG` / `OK` from the rule `s(1) == s(3) -> BUG`. The
-expected and currently-observed pattern is `O0=OK, O1=OK, O2=OK, O3=BUG`.
-A cell whose pattern deviates from that is flagged in red — for example,
-a gfortran version that has already fixed the bug, or one that exhibits
-it at a different optimization level. See the
+For each cell the CI parses the four hex words from stdout and decides
+`BUG` / `OK` by `s(1) == s(3) -> BUG`. The expected pattern is
+`O0=OK, O1=OK, O2=OK, O3=BUG`. See the
 [Actions tab](https://github.com/Migelo/gfortran-o3-fre-inline-miscompile/actions)
-for the latest results.
-
-You can re-trigger the matrix at any time via "Run workflow" on the
-Actions page (the workflow has a `workflow_dispatch` trigger).
+for live results.
 
 ### Intel ifx (control case)
 
-The same `repro.f90` compiled with Intel `ifx` (from oneAPI) does NOT
-exhibit the bug at any optimization level (`-O0`, `-O1`, `-O2`, `-O3`),
-demonstrating that the misbehaviour is specific to gfortran's
-FRE / early-VRP / small-function-inliner pass cluster and not a
-Fortran-standard ambiguity in the reproducer. The `intel-ifx` matrix
-in the workflow runs as a control. The Intel oneAPI install is
-provided by the public composite action
+The same `repro.f90` compiled with Intel `ifx` does NOT exhibit the
+symptom at any optimisation level. `ifx` is more conservative about
+exploiting signed-overflow UB on this pattern; this is a difference in
+*policy*, not a contradiction. The Intel oneAPI install is provided by
+the public composite action
 [`Migelo/setup-intel-oneapi`](https://github.com/Migelo/setup-intel-oneapi).
 
 ### NVIDIA nvfortran (control case)
 
-The same `repro.f90` compiled with NVIDIA `nvfortran` (from the HPC SDK
-25.11, run inside the official `nvcr.io/nvidia/nvhpc:25.11-devel-cuda13.0-ubuntu24.04`
-container) does NOT exhibit the bug at any optimization level
-(`-O0`, `-O1`, `-O2`, `-O3`), providing a third independent
-Fortran-compiler data point. Combined with the Intel `ifx` matrix, this
-shows the bug is specific to gfortran's FRE / early-VRP / small-function-
-inliner pass cluster after inlining a contained subroutine with the
-`intent(inout) :: state` / `intent(out) :: z` argument split — not a
-Fortran-standard ambiguity in the reproducer. The `nvfortran` matrix in
-the workflow runs as an additional control alongside `intel-ifx`.
+The same `repro.f90` compiled with NVIDIA `nvfortran` 25.11 does NOT
+exhibit the symptom at any optimisation level. Same caveat as above —
+this is policy, not soundness.
+
+## Status
+
+Not filed as a gcc bugzilla report. The minimal C reproducer is a
+textbook instance of the [PR 30475](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=30475)
+(RESOLVED INVALID, 2007) class of signed-overflow UB exploitation;
+the missing `-Wstrict-overflow` diagnostic is tracked separately in
+[PR 80511](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=80511) (open).
+The on-topic upstream contribution, if any, would be attaching
+`repro_min.c` to PR 80511 as one more match.pd site whose fold no
+longer warns. The repository's value is downstream: a clear minimal
+reproducer, an honest flag matrix, and a worked example of the
+per-file CMake fix that scientific-code projects can copy.
